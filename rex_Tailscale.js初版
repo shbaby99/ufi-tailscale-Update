@@ -4,6 +4,10 @@
     const pluginName = "Tailscale"
     const _PREV_VER = '1.0.1'
     const _SIG = '@@TS_PLUGIN_ID_x7k9m2p4@@'
+    const _UPDATE_URL = 'https://cdn.jsdelivr.net/gh/shbaby99/ufi-tailscale-Update@main/latest.json'
+    let _updating = false
+    let _manifest = null
+    let _hasPluginUpdate = false
 
     const DEFAULT_CONFIG = `# Tailscale 配置文件，请根据需要修改配置
 
@@ -185,6 +189,85 @@ FLAGS=""
         }
         return false
     }
+
+    const _fetchManifest = async () => {
+        const url = _UPDATE_URL + '?_=' + Date.now();
+        const tmp = '/data/local/tmp/_ts_manifest.tmp';
+        const CURL = '/data/data/com.minikano.f50_sms/files/curl';
+        await run(`rm -f ${sq(tmp)}`, 1000);
+        const r = await run(`${CURL} -sL --connect-timeout 5 --max-time 10 ${sq(url)} -o ${sq(tmp)} && timeout 2s awk '{print}' ${sq(tmp)}`, 15000);
+        const text = String(r?.content || '').trim();
+        await run(`rm -f ${sq(tmp)}`, 1000);
+        if (!text || text[0] !== '{') return null;
+        try {
+            const j = JSON.parse(text);
+            if (j.version && j.js) return j;
+        } catch {}
+        return null;
+    };
+
+    const _applyPluginUpdate = async (newJsUrl) => {
+        const tmpJs = '/data/local/tmp/_ts_new.js';
+        const CURL = '/data/data/com.minikano.f50_sms/files/curl';
+        await run(`rm -f ${sq(tmpJs)}`, 2000);
+        await run(`${CURL} -sL --connect-timeout 8 --max-time 60 ${sq(newJsUrl)} -o ${sq(tmpJs)}`, 65000);
+        const sizeR = await run(`stat -c %s ${sq(tmpJs)} 2>/dev/null || echo 0`, 5000);
+        const size = parseInt(String(sizeR?.content || '0').trim(), 10) || 0;
+        if (size < 500) { await run(`rm -f ${sq(tmpJs)}`); throw new Error('新文件下载失败或过小(实际:' + size + ')'); }
+        const currentText = await getCustomHead();
+        if (!currentText) throw new Error('无法读取插件列表');
+        const _reEsc = s => s.replace(/[\[\]]/g, '\\$&');
+        const _PS = '<!-- [KANO_PLUGIN_START]';
+        const _PE = '<!-- [KANO_PLUGIN_END]';
+        const pluginRegex = new RegExp(_reEsc(_PS) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _reEsc(_PE) + '\\s*\\1\\s*-->', 'g');
+        const newJs = await run(`timeout 5s awk '{print}' ${sq(tmpJs)}`, 10000);
+        const newJsContent = String(newJs?.content || '');
+        if (!newJsContent || newJsContent.length < 500) throw new Error('新文件内容异常');
+        let found = false, newText = currentText, match;
+        while ((match = pluginRegex.exec(currentText)) !== null) {
+            if (match[2].includes(_SIG)) {
+                const pname = match[1].trim();
+                const newBlock = `${_PS} ${pname} -->\n${newJsContent}\n${_PE} ${pname} -->`;
+                newText = currentText.replace(match[0], () => newBlock);
+                found = true;
+                break;
+            }
+        }
+        if (!found) { await run(`rm -f ${sq(tmpJs)}`); throw new Error('未找到当前插件'); }
+        await run(`rm -f ${sq(tmpJs)}`, 2000);
+        const saveResult = await setCustomHead(newText);
+        if (!saveResult || saveResult.result !== 'success') throw new Error('保存失败');
+        return true;
+    };
+
+    const _updateUpdateBtnHighlight = () => {
+        const btn = document.querySelector('#tailscale_update_btn');
+        if (!btn) return;
+        if (_hasPluginUpdate) {
+            btn.innerHTML = '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#4ade80;box-shadow:0 0 4px #4ade80;margin-right:5px;vertical-align:middle;"></span>更新';
+            btn.style.background = 'rgba(34,197,94,.25)';
+            btn.style.borderColor = 'rgba(34,197,94,.5)';
+            btn.style.color = '#86efac';
+        } else {
+            btn.innerHTML = '⬆️ 更新';
+            btn.style.background = 'rgba(52,152,219,.12)';
+            btn.style.borderColor = 'rgba(52,152,219,.2)';
+            btn.style.color = '#5dade2';
+        }
+    };
+
+    const _checkPluginUpdate = async () => {
+        if (_updating) return;
+        const m = await _fetchManifest();
+        if (m && m.version !== _PREV_VER) {
+            _manifest = m;
+            _hasPluginUpdate = true;
+        } else {
+            _manifest = null;
+            _hasPluginUpdate = false;
+        }
+        _updateUpdateBtnHighlight();
+    };
 
     const checkAdvanceFunc = async () => {
         const res = await runShellWithRoot('whoami')
@@ -1113,9 +1196,52 @@ FLAGS=""
     updateBtn.innerHTML = '⬆️ 更新'
     updateBtn.style.cssText = 'background:rgba(52,152,219,.12);border-color:rgba(52,152,219,.2);color:#5dade2;padding:4px 12px;font-size:.7rem;border-radius:6px;'
     updateBtn.onclick = async () => {
-        if (isUpdating || isInstalling || isUninstalling) return
+        if (isUpdating || isInstalling || isUninstalling || _updating) return
         if (! await checkAdvanceFunc()) return createToast('无Root权限！', 'red')
         if (! await isInstall()) return createToast('请先安装！', 'red')
+
+        if (!_manifest) {
+            _updating = true
+            createToast('正在检查更新...')
+            const m = await _fetchManifest()
+            if (m && m.version !== _PREV_VER) {
+                _manifest = m
+                _hasPluginUpdate = true
+            }
+            _updating = false
+        }
+
+        if (_manifest) {
+            const ok = await new Promise(resolve => {
+                const { el, close } = createFixedToast('ts_plugin_upd_confirm', `
+                    <div style="pointer-events:all;width:88vw;max-width:400px">
+                        <div class="title" style="margin:0 0 8px">插件有新版本 v${esc(_manifest.version)}</div>
+                        <div style="font-size:.58rem;line-height:1.6;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:8px 10px;max-height:40vh;overflow-y:auto;white-space:pre-wrap;">${esc(_manifest.notes || '暂无更新说明')}</div>
+                        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+                            <button id="ts_plugin_upd_cancel" style="font-size:.62rem;padding:5px 14px;border-radius:7px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:inherit;cursor:pointer;">取消</button>
+                            <button id="ts_plugin_upd_ok" style="font-size:.62rem;padding:5px 14px;border-radius:7px;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.25);color:#86efac;cursor:pointer;">更新插件</button>
+                        </div>
+                    </div>`);
+                el.querySelector('#ts_plugin_upd_cancel').onclick = () => { close(); resolve(false); };
+                el.querySelector('#ts_plugin_upd_ok').onclick = () => { close(); resolve(true); };
+            });
+            if (!ok) return;
+
+            _updating = true
+            const { close: closeLoading } = createFixedToast('ts_plugin_updating', '正在更新插件...');
+            try {
+                await _applyPluginUpdate(_manifest.js);
+                closeLoading();
+                createToast('插件已更新到 v' + _manifest.version + '，2秒后刷新页面', 'green');
+                setTimeout(() => location.reload(), 2000);
+            } catch (e) {
+                closeLoading();
+                createToast('插件更新失败：' + (e?.message || e), 'red', 5000);
+            } finally {
+                _updating = false;
+            }
+            return;
+        }
 
         isUpdating = true
         try {
@@ -1333,9 +1459,10 @@ FLAGS=""
 
     if (typeof collapseGen === 'function') {
         collapseGen("#collapse_Tailscale_btn", "#collapse_Tailscale", "#collapse_Tailscale", (newVal) => {
-            if (newVal == 'open') {
-                startTimers()
-                isInstall().then(installed => {
+        if (newVal == 'open') {
+            startTimers()
+            _checkPluginUpdate()
+            isInstall().then(installed => {
                     if (installed) {
                         showConf()
                         if (configLogVisible) startLogPolling()
@@ -1352,6 +1479,7 @@ FLAGS=""
 
     if (localStorage.getItem("#collapse_Tailscale") === 'open') {
         startTimers()
+        _checkPluginUpdate()
         isInstall().then(installed => {
             if (installed) {
                 showConf()
