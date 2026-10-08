@@ -1,0 +1,1364 @@
+//<script>
+(async () => {
+
+    const pluginName = "Tailscale"
+    const _PREV_VER = '1.0.1'
+    const _SIG = '@@TS_PLUGIN_ID_x7k9m2p4@@'
+
+    const DEFAULT_CONFIG = `# Tailscale 配置文件，请根据需要修改配置
+
+# ============ 基础配置 ============
+# 是否启用Tailscale服务（true/false）
+ENABLED="true"
+
+# Tailscaled监听端口（留空使用默认端口41641）
+PORT=""
+
+# ============ 网络配置 ============
+# 是否接受路由（true/false）
+ACCEPT_ROUTES="false"
+
+# 主机名
+HOSTNAME="REX"
+
+# 是否使用MagicDNS（true/false）
+ACCEPT_DNS="false"
+
+# ============ 路由配置 ============
+# 是否作为出口节点（true/false）
+ADVERTISE_EXIT_NODE="false"
+
+# 使用的出口节点（IP或主机名）
+EXIT_NODE=""
+
+# 广播路由（逗号或空格分隔，例如：192.168.0.0/24,10.0.0.0/8）
+# 广播子网路由至 Tailscale
+ADVERTISE_ROUTES=""
+
+# 子网互通（true/false，禁用子网路由的源网络地址转换）
+DISABLE_SNAT_SUBNET_ROUTES="false"
+
+# 子网路由（逗号或空格分隔，例如：192.168.1.0/24,192.168.2.0/24）
+# 通过本机访问的其他Tailscale节点的子网
+SUBNET_ROUTES=""
+
+# ============ 自建 Headscale 配置 ============
+# 服务器地址
+LOGIN_SERVER=""
+
+# 认证密钥
+AUTHKEY=""
+
+# ============ 其他配置 ============
+# 其他额外参数（空格分隔，例如：--exit-node=10.0.0.1 --exit-node-allow-lan-access）
+# 更多参数请参考：https://tailscale.com/docs/reference/tailscale-cli/up
+FLAGS=""
+`
+
+    let AP_ACCESS_ENABLED = false
+    let Log_INTERVAL = null
+    let statusTimer = null
+    let allStateTimer = null
+    let isInstalling = false
+    let isUninstalling = false
+    let isUpdating = false
+    let configLogVisible = false
+    let prevLogText = ''
+    let _resetCount = 0
+    let _resetTimer = null
+    let _stopCount = 0
+    let _stopTimer = null
+    let _restartCount = 0
+    let _restartTimer = null
+    let _logoutCount = 0
+    let _logoutTimer = null
+    let _uninstallCount = 0
+    let _uninstallTimer = null
+    let lastUserInfo = (() => {
+        try {
+            const s = localStorage.getItem('ts_last_user')
+            return s ? JSON.parse(s) : null
+        } catch { return null }
+    })()
+
+    const sq = (v) => `'${String(v ?? '').replace(/'/g, `'\\''`)}'`
+
+    const esc = (v) => String(v ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;')
+
+    const sleep = (sec = 100) => new Promise((resolve) => setTimeout(resolve, sec))
+
+    const createRandomString = (length = 8) => {
+        const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        let result = '';
+        for (let i = 0; i < length; i++) result += characters.charAt(Math.floor(Math.random() * characters.length));
+        return result;
+    }
+
+    const saveLastUser = (info) => {
+        lastUserInfo = info
+        try { localStorage.setItem('ts_last_user', JSON.stringify(info)) } catch { }
+    }
+
+    const clearLastUser = () => {
+        lastUserInfo = null
+        try { localStorage.removeItem('ts_last_user') } catch { }
+    }
+
+    const ts2cn = (txt) => {
+        if (!txt) return txt
+        return String(txt)
+            .replace(/Unable to get device info,?\s*Tailscale may not be running\.?/gi, '无法获取设备信息：Tailscale 可能没有运行')
+            .replace(/Tailscale is stopped[.,]?/gi, 'Tailscale 已停止')
+            .replace(/not logged in[.,]?/gi, '未登录')
+            .replace(/Logged out[.,]?/gi, '已退出登录')
+            .replace(/NeedsLogin[.,]?/gi, '需要登录')
+            .replace(/NoState[.,]?/gi, '无状态')
+            .replace(/No matching peer[.,]?/gi, '没有匹配的设备')
+            .replace(/timed out[.,]?/gi, '超时')
+            .replace(/connection refused[.,]?/gi, '连接被拒绝')
+            .replace(/network is unreachable[.,]?/gi, '网络不可达')
+            .replace(/is offline[.,]?/gi, '离线')
+            .replace(/no such host[.,]?/gi, '找不到主机')
+            .replace(/Permission denied[.,]?/gi, '权限不足')
+            .replace(/doLogin\(regen=(\w+),\s*hasUrl=(\w+)\)/gi, '执行登录（重新生成=$1, 有链接=$2）')
+            .replace(/Tailscale is starting\.\s*Please wait\./gi, 'Tailscale 正在启动，请稍候')
+            .replace(/health\(warnable=([\w-]+)\):\s*ok/gi, '健康检查（$1）：正常')
+            .replace(/health\(warnable=([\w-]+)\):\s*error:\s*/gi, '健康检查（$1）：异常 - ')
+            .replace(/somebody \(likely systemd-networkd\) deleted ip rules; restoring Tailscale's/gi, '有进程删掉了 IP 规则，正在恢复 Tailscale 的规则')
+            .replace(/control server key from/gi, '控制服务器密钥来自')
+            .replace(/RegisterReq: onode=(\S*)\s+node=(\S*)\s+fup=(\w+)\s+nks=(\w+)/gi, '注册请求：节点=$2 强制更新=$3 新密钥=$4')
+            .replace(/RegisterReq: got response;\s*nodeKeyExpired=(\w+),\s*machineAuthorized=(\w+);\s*authURL=(\w+)/gi, '注册响应：节点密钥过期=$1 设备已授权=$2 授权链接=$3')
+            .replace(/got new dial plan from control/gi, '从控制服务器收到新的拨号计划')
+            .replace(/using tailnet default auto-update setting:\s*(\w+)/gi, '使用默认自动更新设置：$1')
+            .replace(/offline auto-update: starting update checks/gi, '离线自动更新：开始检查')
+            .replace(/offline auto-update: stopping update checks/gi, '离线自动更新：停止检查')
+            .replace(/new contact: control-netmap/gi, '新联系人：控制网络映射')
+            .replace(/active login:\s*(\S+)/gi, '当前登录账号：$1')
+            .replace(/netmap: suggested exit node: no preferred DERP, try again later/gi, '出口节点建议：暂时没有首选 DERP，稍后重试')
+            .replace(/Switching ipn state (\w+) -> (\w+)/gi, '状态切换：$1 → $2')
+            .replace(/SetPrivateKey called \(init\)/gi, '设置私钥（初始化）')
+            .replace(/wgengine: Reconfig: configuring router/gi, '网络引擎：重配路由')
+            .replace(/wgengine: Reconfig: user dialer/gi, '网络引擎：重配拨号器')
+            .replace(/wgengine: Reconfig: configuring DNS/gi, '网络引擎：重配 DNS')
+            .replace(/tsdial: bart table size:\s*(\d+)/gi, '拨号表大小：$1')
+            .replace(/dns: Set:\s*\{[^}]*Hosts:(\d+)\}/gi, 'DNS 设置：主机数=$1')
+            .replace(/dns: Resolvercfg:\s*\{[^}]*Hosts:(\d+)[^}]*\}/gi, 'DNS 解析配置：主机数=$1')
+            .replace(/dns: OScfg:\s*\{\}/gi, '系统 DNS 配置：空')
+            .replace(/peerapi: serving on\s*(\S+)/gi, 'P2P API 监听：$1')
+            .replace(/netcheck: DetectCaptivePortal\(found=(\w+)\)/gi, '门户探测：$1')
+            .replace(/magicsock: home DERP changing from (\S+)\s*\[(\d+)ms\]\s*to (\S+)\s*\[(\d+)ms\]\s*\(forced=(\w+)\)/gi, '主 DERP 切换：$1（$2ms）→ $3（$4ms），强制=$5')
+            .replace(/magicsock: home is now (\S+)\s*\((\S+)\)/gi, '当前主 DERP：$1（$2）')
+            .replace(/updating netmap in disk cache/gi, '更新磁盘缓存中的网络映射')
+            .replace(/magicsock: adding connection to (\S+) for home-keep-alive/gi, '添加 $1 连接用于保活')
+            .replace(/magicsock: (\d+) active derp conns:\s*(.+)/gi, '$1 条活动 DERP 连接：$2')
+            .replace(/derphttp\.Client\.Connect: connecting to (\S+)\s*\((\S+)\)/gi, '连接 DERP：$1（$2）')
+            .replace(/control: NetInfo:\s*NetInfo\{[^}]*firewallmode="(\S*)"\}/gi, '网络信息：防火墙模式=$1')
+            .replace(/magicsock: endpoints changed:\s*(.+)/gi, '端点变化：$1')
+            .replace(/\(stun\)/g, '(STUN)')
+            .replace(/\(local\)/g, '(本地)')
+            .replace(/magicsock: derp-(\d+) connected; connGen=(\d+)/gi, 'DERP-$1 已连接（第 $2 代）')
+            .replace(/Received error:\s*PollNetMap:\s*unexpected EOF/gi, '收到错误：与控制服务器的长连接中断')
+            .replace(/control: controlhttp: forcing port 443 dial due to recent noise dial/gi, '控制服务器：强制用 443 端口')
+            .replace(/Starting tailscale update\.\.\./gi, '开始 Tailscale 检查更新…')
+            .replace(/dns: resolver: forward: no upstream resolvers set, returning SERVFAIL/gi, 'DNS 转发：没有上游 DNS，返回失败')
+            .replace(/already running stable version\s*(\S+);\s*no update needed/gi, '已是稳定版 $1，无需更新')
+            .replace(/SUCCESS: Tailscale configured/gi, '✅ Tailscale 配置成功')
+            .replace(/Starting IPv6 log monitor\.\.\./gi, '启动 IPv6 日志监控…')
+            .replace(/Some peers are advertising routes but --accept-routes is false/gi, '有设备宣告了子网路由，但你没开 --accept-routes（不影响使用）')
+    }
+
+    const oldDom = document.getElementById(`IFRAME_REX_${pluginName}`);
+    if (oldDom) oldDom.remove();
+
+    const checkWeakToken = () => {
+        if (typeof SHA256 !== 'undefined' && KANO_TOKEN) {
+            const tokenUpper = String(KANO_TOKEN).toUpperCase()
+            let weakTokenList = ["admin", "password", "666", "6666", "12345", "123456", "1234567", "12345678", "123456789", "1234567890", "root"]
+            for (let token of weakTokenList) {
+                if (SHA256(token) == tokenUpper) return true
+            }
+        }
+        return false
+    }
+
+    const checkAdvanceFunc = async () => {
+        const res = await runShellWithRoot('whoami')
+        return !!(res.content && res.content.includes('root'))
+    }
+
+    const isTailscaledRunning = async () => {
+        try {
+            const res = await runShellWithRoot(`pgrep -f "/data/rex_Tailscale/bin/tailscaled" | head -1`)
+            return !!(res.content && res.content.trim())
+        } catch { return false }
+    }
+
+    const isInstall = async () => {
+        const res = await runShellWithRoot(`test -f /data/rex_Tailscale/service.sh && echo "exists" || echo "not_found"`)
+        return !!(res.content && res.content.includes("exists"))
+    }
+
+    const checkIsBootUp = async (installed) => {
+        if (installed === undefined) installed = await isInstall()
+        if (!installed) return false
+        const bootScriptExists = await runShellWithRoot(`test -f /sdcard/ufi_tools_boot.sh && echo "exists" || echo "not_found"`)
+        if (bootScriptExists.content && bootScriptExists.content.includes("not_found")) return false
+        const res = await runShellWithRoot(`
+            grep -q '/data/rex_Tailscale/service.sh start' /sdcard/ufi_tools_boot.sh 2>/dev/null
+            echo $?
+        `)
+        return res.content.trim() == '0';
+    }
+
+    const checkApAccessEnabled = async () => {
+        try {
+            const res = await runShellWithRoot(`ls /data/rex_Tailscale/flag/enableHotspotAccess`)
+            return res.content && res.content.includes('enableHotspotAccess')
+        } catch { return false }
+    }
+
+    const getUserInfo = async () => {
+        try {
+            const res = await runShellWithRoot(`/data/rex_Tailscale/service.sh status_json`)
+            if (!res.success || !res.content || typeof res.content !== 'string') {
+                return lastUserInfo || { isLoggedIn: false, userName: '', hostName: '' }
+            }
+            try {
+                const status = JSON.parse(res.content || '{}')
+                if (status && status.Self) {
+                    const userIdStr = String(status.Self.UserID)
+                    const userProfile = (status.User && (status.User[userIdStr] || Object.values(status.User)[0])) || null
+                    const hasUserProfile = userProfile && userProfile.LoginName
+                    const isNotNeedingLogin = status.BackendState !== 'NeedsLogin' && status.BackendState !== 'NoState'
+                    if (hasUserProfile) {
+                        const info = {
+                            isLoggedIn: isNotNeedingLogin,
+                            userName: userProfile?.DisplayName || userProfile?.LoginName || status.Self.DNSName || '未知用户',
+                            hostName: status.Self.HostName || '',
+                        }
+                        if (info.isLoggedIn) saveLastUser(info)
+                        return info
+                    }
+                    return lastUserInfo || { isLoggedIn: false, userName: '', hostName: '' }
+                }
+            } catch (e) { }
+        } catch (error) { }
+        return lastUserInfo || { isLoggedIn: false, userName: '', hostName: '' }
+    }
+
+    const showConf = async () => {
+        try {
+            const Tailscale_config = document.querySelector('#Tailscale_config')
+            if (Tailscale_config) {
+                const checkFile = await runShellWithRoot(`test -f /data/rex_Tailscale/config.txt && echo "exists" || echo "not_found"`)
+                if (checkFile.content && checkFile.content.includes("not_found")) {
+                    Tailscale_config.value = DEFAULT_CONFIG
+                } else {
+                    const res = await runShellWithRoot(`timeout 2s awk '{print}' /data/rex_Tailscale/config.txt`)
+                    Tailscale_config.value = res.content || ""
+                }
+            }
+        } catch (e) { }
+    }
+
+    const uploadTailscaleConfig = async (conf) => {
+        try {
+            const file = new File([conf], "config.txt", { type: "text/plain" });
+            const formData = new FormData();
+            formData.append("file", file);
+            const res = await (await fetch(`${KANO_baseURL}/upload_img`, {
+                method: "POST",
+                headers: common_headers,
+                body: formData,
+            })).json()
+
+            if (res.url) {
+                let foundFile = await runShellWithRoot(`ls ${sq('/data/data/com.minikano.f50_sms/files' + res.url)}`)
+                if (!foundFile.content) throw "上传失败"
+                let resShell = await runShellWithRoot(`mv ${sq('/data/data/com.minikano.f50_sms/files' + res.url)} /data/rex_Tailscale/config.txt`)
+                if (resShell.success) {
+                    createToast(`配置保存成功！正在重启...`, 'green')
+                    const restartBtn = document.getElementById('tailscale_restart_btn');
+                    if (restartBtn) restartBtn.click();
+                    await showConf()
+                }
+            } else throw res.error || ''
+        } catch (e) {
+            createToast(`保存失败!`, 'red')
+        } finally {
+            genLog()
+        }
+    }
+
+    const genLog = async () => {
+        const Tailscale_textarea = document.querySelector("#Tailscale_textarea")
+        if (Tailscale_textarea) {
+            const res = await runShellWithRoot(`timeout 2s  awk '{print}' /dev/log/Tailscale_LOG.txt | tail -n 50`)
+            if (res.content == prevLogText) return
+            prevLogText = res.content
+            const convertedContent = ts2cn(res.content).replace(
+                /(\d{4})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2}):(\d{2})/g,
+                (match, year, month, day, hour, minute, second) => {
+                    const utcDate = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
+                    return utcDate.toLocaleString('sv-SE').replace(/-/g, '/').replace('T', ' ')
+                }
+            )
+            Tailscale_textarea.value = `${convertedContent}\n`
+            Tailscale_textarea.scrollTop = Tailscale_textarea.scrollHeight
+        }
+    }
+
+    const startLogPolling = () => {
+        stopLogPolling()
+        genLog()
+        Log_INTERVAL = setInterval(() => genLog(), 2000)
+    }
+
+    const stopLogPolling = () => {
+        if (Log_INTERVAL) { clearInterval(Log_INTERVAL); Log_INTERVAL = null }
+    }
+
+    const updateNatBtnState = async (installed) => {
+        const btn = document.querySelector('#tailscale_nat_btn')
+        if (!btn) return
+        if (installed === undefined) installed = await isInstall()
+        if (!installed) { btn.style.display = 'none'; return }
+        btn.style.display = ''
+        AP_ACCESS_ENABLED = await checkApAccessEnabled()
+        btn.style.background = AP_ACCESS_ENABLED ? "var(--dark-btn-color-active)" : "rgba(255,255,255,.05)"
+    }
+
+    const updateBootBtnState = async (installed) => {
+        const boot_on = document.querySelector('#tailscale_boot_on')
+        if (!boot_on) return
+        if (installed === undefined) installed = await isInstall()
+        if (!installed) { boot_on.style.display = 'none'; return }
+        boot_on.style.display = ''
+        const isBootUp = await checkIsBootUp(installed)
+        if (isBootUp) {
+            boot_on.style.background = "var(--dark-btn-color-active)"
+            boot_on.innerHTML = "✅ 自启"
+        } else {
+            boot_on.style.background = "rgba(168,85,247,.12)"
+            boot_on.innerHTML = "⏳ 自启"
+        }
+    }
+
+    const updateLoginBtnState = async (installed, isFreshInstall) => {
+        const login_container = document.querySelector('#tailscale_login_container')
+        if (!login_container) return
+        if (installed === undefined) installed = await isInstall()
+        if (!installed) { login_container.innerHTML = ''; return }
+
+        const userInfo = isFreshInstall
+            ? (lastUserInfo || { isLoggedIn: false, userName: '', hostName: '' })
+            : await getUserInfo()
+
+        if (userInfo.isLoggedIn) {
+            login_container.innerHTML = `
+                <button id="tailscale_username_btn" class="btn" style="background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.2);color:#22c55e;padding:4px 12px;font-size:.7rem;border-radius:6px;cursor:pointer;" title="点击跳转到管理页面">
+                    <span style="margin-right:4px;">✓</span>${esc(userInfo.userName)}
+                </button>
+                <button id="tailscale_logout_btn" class="btn" style="background:rgba(220,53,69,.12);border-color:rgba(220,53,69,.2);color:#dc3545;padding:4px 12px;font-size:.7rem;border-radius:6px;">退出登录</button>
+            `
+            const usernameBtn = document.querySelector('#tailscale_username_btn')
+            if (usernameBtn) {
+                usernameBtn.onclick = () => {
+                    window.open('https://login.tailscale.com/admin/machines', '_blank')
+                }
+            }
+            const logoutBtn = document.querySelector('#tailscale_logout_btn')
+            if (logoutBtn) {
+                logoutBtn.onclick = async () => {
+                    if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+                    if (_logoutTimer) clearTimeout(_logoutTimer)
+                    _logoutTimer = setTimeout(() => { _logoutCount = 0 }, 2000)
+                    if (_logoutCount++ < 2) return createToast(_logoutCount === 1 ? "再点两次确认退出" : "再点一次确认退出", 'pink', 2000)
+                    _logoutCount = 0
+                    clearTimeout(_logoutTimer)
+                    _logoutTimer = null
+                    createToast("正在退出登录...")
+                    await runShellWithRoot(`/data/rex_Tailscale/service.sh logout`)
+                    clearLastUser()
+                    createToast("已退出登录", 'green')
+                    genLog()
+                    setTimeout(() => updateLoginBtnState(), 1000)
+                }
+            }
+        } else {
+            login_container.innerHTML = `<button id="tailscale_login_btn" class="btn" style="background:rgba(52,152,219,.12);border-color:rgba(52,152,219,.2);color:#5dade2;padding:4px 12px;font-size:.7rem;border-radius:6px;">登录</button>`
+            const loginBtn = document.querySelector('#tailscale_login_btn')
+            if (loginBtn) {
+                loginBtn.onclick = async () => {
+                    if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+                    createToast("正在获取登录链接...")
+                    const res = await runShellWithRoot(`/data/rex_Tailscale/service.sh get_login_url`)
+                    const loginUrl = res.content ? res.content.trim() : ''
+                    if (loginUrl && loginUrl.includes('https://')) {
+                        createToast(`正在打开登录页面...`, 'green', 5000)
+                        window.open(loginUrl, '_blank')
+                        genLog()
+                        let checkCount = 0
+                        const maxChecks = 30
+                        const checkInterval = setInterval(async () => {
+                            checkCount++
+                            const info = await getUserInfo()
+                            if (info.isLoggedIn) {
+                                clearInterval(checkInterval)
+                                updateLoginBtnState()
+                                createToast("登录成功！", 'green')
+                                genLog()
+                            } else if (checkCount >= maxChecks) {
+                                clearInterval(checkInterval)
+                                createToast("登录检测超时，请手动刷新或重新登录", 'pink')
+                                updateLoginBtnState()
+                            }
+                        }, 2000)
+                    } else {
+                        createToast("未找到登录链接，请先重启服务生成新的登录链接", 'red', 6000)
+                        genLog()
+                    }
+                }
+            }
+        }
+    }
+
+    const updateInstallBtnState = async (installed) => {
+        const install_container = document.querySelector('#tailscale_install_container')
+        if (!install_container) return
+        if (installed === undefined) installed = await isInstall()
+        if (installed) { install_container.style.display = 'none'; return }
+
+        install_container.style.cssText = 'display:flex; width: 100%; justify-content: center; padding: 20px 0;'
+        install_container.innerHTML = `
+            <div style="text-align: center; width: 100%;">
+                <div style="margin-bottom: 12px; color: #888; font-size: 13px;">Tailscale 组网服务尚未安装，点击下方按钮一键部署</div>
+                <button id="tailscale_install_btn" class="btn" style="background:rgba(34,197,94,.15);border-color:rgba(34,197,94,.4);color:#22c55e;padding: 8px 28px; font-size: 14px; border-radius: 8px; font-weight: bold; cursor: pointer;">🚀 开始安装</button>
+            </div>
+        `
+
+        const installBtn = document.querySelector('#tailscale_install_btn')
+        if (installBtn) {
+            installBtn.onclick = async () => {
+                if (isInstalling || isUninstalling) return
+                if (checkWeakToken()) { return createToast(`检测到弱口令，请先修改密码！`, "red", 8000) }
+                if (! await checkAdvanceFunc()) return createToast("没有开启高级功能！", 'red')
+                if (await isInstall()) return createToast("已安装，请勿重复安装！", 'red')
+
+                isInstalling = true
+                try {
+                    createToast("开始下载安装包...")
+                    const res1 = await runShellWithRoot(`/data/data/com.minikano.f50_sms/files/curl -L "https://pan.rexe.cc/d/UFI-TOOLS-UPDATE/plugins/rex_Tailscale.zip" -o /data/rex_Tailscale.zip --write-out "DOWNLOAD_DONE\nTotal: %{size_download} bytes\nSpeed: %{speed_download} B/s\nTime: %{time_total} sec\n" > /data/tailscale_download.log 2>&1 &`, 100 * 1000)
+
+                    if (!res1.success) { createToast("下载失败", 'red'); return }
+
+                    let log = ''
+                    const max_times = 600
+                    let count_times = 0
+                    const { el, close } = createFixedToast("tailscale_download_toast", `<pre style="white-space: pre-wrap;min-width:300px;text-align: center;">等待日志中...</pre>`, '')
+
+                    const interval = setInterval(async () => {
+                        const dlog = await runShellWithRoot("timeout 2s awk '{print}' /data/tailscale_download.log")
+                        const lines = dlog.content.split('\n');
+                        log = lines.slice(-6).join('\n');
+                        el.innerHTML = `<pre style="white-space: pre-wrap;min-width:300px;text-align: center;">${esc(log).replaceAll('\n', "<br>")}</pre>`
+                        if (log.includes('DOWNLOAD_DONE')) { setTimeout(() => { close() }, 2000) }
+                    }, 1000)
+
+                    while (true) {
+                        if (max_times <= count_times) {
+                            clearInterval(interval); close()
+                            createToast("下载超时，请检查网络连接或稍后重试！", 'red')
+                            return
+                        }
+                        if (log.includes('DOWNLOAD_DONE')) { clearInterval(interval); break }
+                        count_times++
+                        await new Promise(resolve => setTimeout(resolve, 1000))
+                    }
+
+                    await runShellWithRoot("rm -f /data/tailscale_download.log")
+
+                    const checkDownload = await runShellWithRoot(`test -f /data/rex_Tailscale.zip && echo "exists" || echo "not_found"`)
+                    if (!checkDownload.content || checkDownload.content.includes("not_found")) { createToast("下载文件不存在，安装失败", 'red'); return }
+
+                    const hasUnzip = await runShellWithRoot(`which unzip 2>/dev/null || echo "not_found"`)
+                    if (!hasUnzip.content || hasUnzip.content.includes('not_found')) {
+                        createToast("设备缺少 unzip 命令，无法解压安装包", 'red', 6000)
+                        await runShellWithRoot(`rm -f /data/rex_Tailscale.zip`)
+                        return
+                    }
+
+                    createToast("解压中...")
+                    const res2 = await runShellWithRoot(`
+                        cd /data && rm -rf rex_Tailscale_temp rex_Tailscale && 
+                        mkdir -p rex_Tailscale_temp && 
+                        unzip -o rex_Tailscale.zip -d rex_Tailscale_temp && 
+                        if [ -d "rex_Tailscale_temp/rex_Tailscale" ]; then
+                            mv rex_Tailscale_temp/rex_Tailscale rex_Tailscale
+                            rm -rf rex_Tailscale_temp
+                        else
+                            mv rex_Tailscale_temp rex_Tailscale
+                        fi
+                        mkdir -p /data/rex_Tailscale/bin /data/rex_Tailscale/data /data/rex_Tailscale/flag
+                        mv /data/rex_Tailscale/tailscale /data/rex_Tailscale/bin/ 2>/dev/null
+                        mv /data/rex_Tailscale/tailscaled /data/rex_Tailscale/bin/ 2>/dev/null
+                    `)
+                    if (!res2.success) { createToast("解压失败", 'red'); return }
+                    const checkFiles = await runShellWithRoot(`
+                        test -f /data/rex_Tailscale/service.sh && 
+                        test -f /data/rex_Tailscale/bin/tailscale && 
+                        test -f /data/rex_Tailscale/bin/tailscaled && 
+                        echo "exists" || echo "not_found"
+                    `)
+                    if (!checkFiles.content || checkFiles.content.includes("not_found")) {
+                        createToast("关键文件缺失，安装失败", 'red')
+                        await runShellWithRoot(`rm -rf /data/rex_Tailscale /data/rex_Tailscale.zip`)
+                        return
+                    }
+
+                    createToast("设置权限...")
+                    await runShellWithRoot(`chmod 777 /data/rex_Tailscale/bin/tailscale /data/rex_Tailscale/bin/tailscaled /data/rex_Tailscale/service.sh || true`)
+
+                    createToast("设置自启动...")
+                    await runShellWithRoot(`grep -qxF '/data/rex_Tailscale/service.sh start' /sdcard/ufi_tools_boot.sh || echo '/data/rex_Tailscale/service.sh start' >> /sdcard/ufi_tools_boot.sh`)
+
+                    createToast("启动服务...")
+                    await runShellWithRoot(`nohup /data/rex_Tailscale/service.sh start >/dev/null 2>&1 &`)
+                    await runShellWithRoot(`rm -f /data/rex_Tailscale.zip /data/rex_Tailscale/Tailscale*.js`)
+
+                    createToast(`安装成功！`, 'green')
+                    await Promise.all([showConf(), updateAllStates(true, true)])
+                    startLogPolling()
+                } finally {
+                    isInstalling = false
+                }
+            }
+        }
+    }
+
+    const updateUninstallBtnState = async (installed) => {
+        const uninstall_container = document.querySelector('#tailscale_uninstall_container')
+        if (!uninstall_container) return
+        if (installed === undefined) installed = await isInstall()
+        if (!installed) { uninstall_container.style.display = 'none'; return }
+        uninstall_container.style.display = 'inline-flex'
+        uninstall_container.innerHTML = `<button id="tailscale_uninstall_btn" class="btn" style="background:rgba(220,53,69,.12);border-color:rgba(220,53,69,.2);color:#dc3545;padding:4px 12px;font-size:.7rem;border-radius:6px;">🗑️ 卸载</button>`
+        const uninstallBtn = document.querySelector('#tailscale_uninstall_btn')
+        if (uninstallBtn) {
+            uninstallBtn.onclick = async () => {
+                if (isUninstalling || isInstalling) return
+                if (! await checkAdvanceFunc()) return createToast("无Root权限！", 'red')
+                if (_uninstallTimer) clearTimeout(_uninstallTimer)
+                _uninstallTimer = setTimeout(() => { _uninstallCount = 0 }, 2000)
+                if (_uninstallCount++ < 2) return createToast(_uninstallCount === 1 ? "再点两次确认卸载" : "再点一次确认卸载", 'pink', 2000)
+                _uninstallCount = 0
+                clearTimeout(_uninstallTimer)
+                _uninstallTimer = null
+
+                isUninstalling = true
+                try {
+                    createToast("正在停止服务...", 'yellow')
+                    await runShellWithRoot(`/data/rex_Tailscale/service.sh stop 2>/dev/null; sleep 1`, 30000)
+                    await runShellWithRoot(`
+                        PID1=$(pgrep -f "/data/rex_Tailscale/bin/tailscaled" | head -1)
+                        if [ -n "$PID1" ]; then kill -9 "$PID1" 2>/dev/null; fi
+                        PID2=$(pgrep -f "/data/rex_Tailscale/service.sh" | head -1)
+                        if [ -n "$PID2" ]; then kill -9 "$PID2" 2>/dev/null; fi
+                        sleep 1
+                    `, 10000)
+
+                    createToast("正在清理文件...", 'yellow')
+                    await runShellWithRoot(`
+                        rm -rf /data/rex_Tailscale
+                        rm -f /data/rex_Tailscale.zip
+                        rm -f /data/tailscale_download.log
+                        rm -f /dev/log/Tailscale_LOG.txt
+                    `, 30000)
+
+                    createToast("正在清理自启...", 'yellow')
+                    await runShellWithRoot(`sed -i '\\|^/data/rex_Tailscale/service.sh start$|d' /sdcard/ufi_tools_boot.sh 2>/dev/null; true`)
+
+                    createToast("正在清理防火墙...", 'yellow')
+                    await runShellWithRoot(`
+                        iptables -D INPUT -j ts-input 2>/dev/null
+                        iptables -D FORWARD -j ts-forward 2>/dev/null
+                        iptables -F ts-input 2>/dev/null
+                        iptables -F ts-forward 2>/dev/null
+                        iptables -X ts-input 2>/dev/null
+                        iptables -X ts-forward 2>/dev/null
+                        iptables -t nat -F ts-input 2>/dev/null
+                        iptables -t nat -X ts-input 2>/dev/null
+                        true
+                    `)
+
+                    createToast("正在清理路由和网卡...", 'yellow')
+                    await runShellWithRoot(`
+                        ip link show tailscale0 >/dev/null 2>&1 && ip link delete tailscale0 2>/dev/null
+                        ip route del 100.64.0.0/10 2>/dev/null
+                        true
+                    `)
+
+                    createToast("正在还原 DNS...", 'yellow')
+                    await runShellWithRoot(`
+                        sed -i '/100\\.100\\.100\\.100/d' /etc/resolv.conf 2>/dev/null
+                        sed -i '/Generated by rex_Tailscale/d' /etc/resolv.conf 2>/dev/null
+                        true
+                    `)
+
+                    clearLastUser()
+                    try { localStorage.removeItem('#collapse_Tailscale') } catch (e) { }
+
+                    createToast("✅ 卸载完成，建议重启设备", 'green', 5000)
+                    const cfgEl = document.querySelector('#Tailscale_config')
+                    if (cfgEl) cfgEl.value = ""
+                    const logEl = document.querySelector('#Tailscale_textarea')
+                    if (logEl) logEl.value = ""
+                    await updateAllStates()
+                } finally {
+                    isUninstalling = false
+                }
+            }
+        }
+    }
+
+    const updateMonitorBtnState = async () => {
+        const btn = document.querySelector('#tailscale_monitor_btn')
+        if (!btn) return
+        const checkDisabled = await runShellWithRoot(`test -f /data/rex_Tailscale/flag/ipv6_monitor_disable && echo "exists" || echo "not_found"`)
+        btn.innerHTML = '🛰️ IPv6监测'
+        btn.style.background = (checkDisabled.content && checkDisabled.content.includes("exists"))
+            ? "rgba(255,255,255,.05)" : "var(--dark-btn-color-active)"
+    }
+
+    const updateServiceBtnsState = async (installed, running) => {
+        if (installed === undefined) installed = await isInstall()
+        if (running === undefined) running = installed ? await isTailscaledRunning() : false
+
+        const show = installed ? '' : 'none'
+        const showRunning = (installed && running) ? '' : 'none'
+        const showStopped = (installed && !running) ? '' : 'none'
+
+        if (startBtn) startBtn.style.display = showStopped
+        if (stopBtn) stopBtn.style.display = showRunning
+        if (restartBtn) restartBtn.style.display = showRunning
+
+        if (statusBtn) statusBtn.style.display = show
+        if (networkBtn) networkBtn.style.display = show
+        if (monitorBtn) monitorBtn.style.display = show
+        if (natBtn) natBtn.style.display = show
+        if (configLogBtn) configLogBtn.style.display = show
+        if (adminBtn) adminBtn.style.display = show
+
+        const configLogContainer = document.querySelector('#tailscale_config_log_container')
+        if (configLogContainer) configLogContainer.style.display = (installed && configLogVisible) ? '' : 'none'
+
+        const hintContainer = document.querySelector('#tailscale_hint_container')
+        if (hintContainer) hintContainer.style.display = (installed && configLogVisible) ? '' : 'none'
+    }
+
+    const updateUpdateBtnState = async (installed) => {
+        const container = document.querySelector('#tailscale_update_container')
+        if (!container) return
+        if (installed === undefined) installed = await isInstall()
+        container.style.display = installed ? 'inline-flex' : 'none'
+    }
+
+    const updateStatusUI = async () => {
+        const statusTextEl = document.querySelector('#ts_status_text')
+        const statusDotEl = document.querySelector('#ts_status_dot')
+        const ipEl = document.querySelector('#ts_ip')
+        const versionEl = document.querySelector('#ts_version')
+
+        const installed = await isInstall()
+        if (!installed) {
+            if (statusTextEl) statusTextEl.textContent = '未安装'
+            if (statusDotEl) { statusDotEl.style.background = '#888'; statusDotEl.style.boxShadow = 'none' }
+            if (ipEl) ipEl.textContent = '-'
+            if (versionEl) versionEl.textContent = '-'
+            return
+        }
+
+        const userInfo = await getUserInfo()
+        const running = await isTailscaledRunning()
+
+        if (statusTextEl) {
+            if (running) statusTextEl.textContent = '运行中'
+            else if (userInfo.isLoggedIn) statusTextEl.textContent = '已停止'
+            else statusTextEl.textContent = '未登录'
+        }
+        if (statusDotEl) {
+            if (running) { statusDotEl.style.background = '#22c55e'; statusDotEl.style.boxShadow = '0 0 10px rgba(34,197,94,.6)' }
+            else if (userInfo.isLoggedIn) { statusDotEl.style.background = '#ef4444'; statusDotEl.style.boxShadow = '0 0 10px rgba(239,68,68,.5)' }
+            else { statusDotEl.style.background = '#ff9800'; statusDotEl.style.boxShadow = '0 0 10px rgba(255,152,0,.6)' }
+        }
+
+        try {
+            const r = await runShellWithRoot(`/data/rex_Tailscale/service.sh status_json 2>/dev/null`)
+            const st = JSON.parse(r.content || '{}')
+            const ips = (st && st.Self && st.Self.TailscaleIPs) || []
+            const ip4 = ips.find(x => typeof x === 'string' && x.indexOf('.') > -1) || ''
+            if (ipEl) ipEl.textContent = ip4 || '-'
+        } catch { if (ipEl) ipEl.textContent = '-' }
+
+        try {
+            const verRes = await runShellWithRoot(`/data/rex_Tailscale/bin/tailscale version 2>/dev/null | head -1`)
+            const m = (verRes.content || '').match(/v?\d+\.\d+\.\d+/)
+            if (versionEl) versionEl.textContent = m ? m[0] : '-'
+        } catch { if (versionEl) versionEl.textContent = '-' }
+    }
+
+    const updateAllStates = async (forceInstalled, isFreshInstall) => {
+        const installed = (forceInstalled === true || forceInstalled === false) ? forceInstalled : await isInstall()
+        let running = false
+        if (installed) running = await isTailscaledRunning()
+        await updateInstallBtnState(installed)
+        await updateUninstallBtnState(installed)
+        await Promise.all([
+            updateBootBtnState(installed),
+            updateLoginBtnState(installed, isFreshInstall),
+            updateServiceBtnsState(installed, running),
+            updateMonitorBtnState(),
+            updateNatBtnState(installed),
+            updateUpdateBtnState(installed)
+        ])
+    }
+
+    const startTimers = () => {
+        stopTimers()
+        statusTimer = setInterval(updateStatusUI, 10000)
+        allStateTimer = setInterval(() => updateAllStates(), 5000)
+    }
+
+    const stopTimers = () => {
+        if (statusTimer) { clearInterval(statusTimer); statusTimer = null }
+        if (allStateTimer) { clearInterval(allStateTimer); allStateTimer = null }
+    }
+
+    const showDeviceDialog = (message, title = "设备列表") => {
+        const containerId = "toast_" + createRandomString(4)
+        const id = 'close_message_btn_' + createRandomString(4)
+        const id_refresh = 'refresh_btn_' + createRandomString(4)
+        const message1 = esc(ts2cn(message)).replaceAll('\n', "<br>")
+        const { el, close } = createFixedToast(containerId, `
+        <div style="pointer-events:all;width:80vw;max-width:800px">
+            <div class="title" style="margin:0">${title}</div>
+            <div class="content_message" style="margin:10px 0;max-height: 400px;overflow: auto;font-size: 12px;font-family:monospace;white-space:pre-wrap;">${message1}</div>
+            <div style="text-align:right">
+                <button style="font-size:12px" id="${id_refresh}">刷新</button>
+                <button style="font-size:12px" id="${id}">关闭</button>
+            </div>
+        </div>
+        `)
+        const btn = el.querySelector(`#${id}`)
+        const rBtn = el.querySelector(`#${id_refresh}`)
+        if (!btn) { close(); return }
+
+        const refresh = async (flag = false) => {
+            const msg_el = el.querySelector(`.content_message`)
+            if (!(await isTailscaledRunning())) {
+                msg_el.innerHTML = '<span style="color:#ff9800">⚠️ Tailscale 未运行，请先启动服务</span>'
+                flag && createToast("Tailscale 未运行", 'red')
+                return
+            }
+            const res = await runShellWithRoot(`/data/rex_Tailscale/service.sh list_devices`)
+            if (res.success && res.content) {
+                msg_el.innerHTML = esc(ts2cn(res.content)).replaceAll('\n', "<br>")
+                flag && createToast("设备列表已刷新", 'green')
+            } else { flag && createToast("获取设备列表失败", 'red') }
+        }
+        if (rBtn) rBtn.onclick = async () => { await refresh(true) }
+        btn.onclick = async () => { close() }
+    }
+
+    const showPingDialog = () => {
+        const containerId = "toast_" + createRandomString(4)
+        const id = 'close_ping_btn_' + createRandomString(4)
+        const id_ping = 'exec_ping_btn_' + createRandomString(4)
+        const id_netcheck = 'exec_netcheck_btn_' + createRandomString(4)
+        const id_input = 'ping_input_' + createRandomString(4)
+        const id_output = 'ping_output_' + createRandomString(4)
+
+        const { el, close } = createFixedToast(containerId, `
+        <div style="pointer-events:all;width:80vw;max-width:800px">
+            <div class="title" style="margin:0">Tailscale 网络诊断</div>
+            <div style="margin:10px 0;display:flex;gap:6px;align-items:center;">
+                <input type="text" id="${id_input}" placeholder="输入Tailscale内网IP、主机名或域名" style="flex:1;padding:8px;border:1px solid #444;border-radius:5px;background:#1e1e1e;color:#d4d4d4;font-size:14px;" />
+                <button style="font-size:14px;padding:8px 16px;" id="${id_ping}">Ping</button>
+                <button style="font-size:14px;padding:8px 16px;background:#ff9800;" id="${id_netcheck}">Netcheck</button>
+            </div>
+            <div id="${id_output}" style="margin:10px 0;max-height:400px;overflow:auto;font-size:12px;font-family:monospace;background:#000;color:#0f0;padding:8px;border:1px solid #444;border-radius:5px;white-space:pre-wrap;word-break:break-all;min-height:100px;"></div>
+            <div style="text-align:right"><button style="font-size:12px" id="${id}">关闭</button></div>
+        </div>
+        `)
+
+        const closeBtn = el.querySelector(`#${id}`)
+        const pingBtn = el.querySelector(`#${id_ping}`)
+        const netcheckBtn = el.querySelector(`#${id_netcheck}`)
+        const inputEl = el.querySelector(`#${id_input}`)
+        const outputEl = el.querySelector(`#${id_output}`)
+        if (!closeBtn || !pingBtn || !netcheckBtn || !inputEl || !outputEl) { close(); return }
+
+        outputEl.textContent = '等待执行命令...'
+        let currentInterval = null
+        const clearCurrentInterval = () => { if (currentInterval) { clearInterval(currentInterval); currentInterval = null } }
+
+        const executePing = async () => {
+            if (!(await isTailscaledRunning())) {
+                outputEl.textContent = '⚠️ Tailscale 未运行，请先启动服务'
+                return createToast("Tailscale 未运行", 'red')
+            }
+            const target = inputEl.value.trim()
+            if (!target) return createToast("请输入目标地址", 'red')
+            clearCurrentInterval()
+            outputEl.textContent = `正在 ping ${target}...\n`
+            createToast(`正在执行 ping ${target}...`)
+            await runShellWithRoot(`rm -f /data/rex_Tailscale/tailscale_ping.log`)
+            const startRes = await runShellWithRoot(`/data/rex_Tailscale/service.sh ping ${sq(target)} > /data/rex_Tailscale/tailscale_ping.log 2>&1 & echo $!`, 500)
+            if (!startRes.success) { outputEl.textContent = `启动 ping 命令失败`; return createToast("启动 ping 命令失败", 'red') }
+            const pid = startRes.content ? startRes.content.trim() : ''
+            let count = 0
+            const maxWaitTime = 60
+            currentInterval = setInterval(async () => {
+                const logRes = await runShellWithRoot(`timeout 2s awk '{print}' /data/rex_Tailscale/tailscale_ping.log 2>/dev/null || echo ""`)
+                if (logRes.content) { outputEl.textContent = ts2cn(logRes.content); outputEl.scrollTop = outputEl.scrollHeight }
+                if (pid) {
+                    const checkProcess = await runShellWithRoot(`ps | grep ${sq(pid)} | grep -v grep`)
+                    const isRunning = checkProcess.content && checkProcess.content.includes(pid)
+                    if (!isRunning || count >= maxWaitTime) {
+                        clearCurrentInterval()
+                        const finalRes = await runShellWithRoot(`timeout 2s awk '{print}' /data/rex_Tailscale/tailscale_ping.log 2>/dev/null || echo ""`)
+                        if (finalRes.content) { outputEl.textContent = ts2cn(finalRes.content); outputEl.scrollTop = outputEl.scrollHeight }
+                        createToast(count >= maxWaitTime ? "Ping 超时" : "Ping 执行完成", count >= maxWaitTime ? 'red' : 'green')
+                        await runShellWithRoot(`rm -f /data/rex_Tailscale/tailscale_ping.log`)
+                    }
+                }
+                count++
+            }, 1000)
+        }
+
+        const executeNetcheck = async () => {
+            if (!(await isTailscaledRunning())) {
+                outputEl.textContent = '⚠️ Tailscale 未运行，请先启动服务'
+                return createToast("Tailscale 未运行", 'red')
+            }
+            clearCurrentInterval()
+            outputEl.textContent = `正在执行 Netcheck...\n`
+            createToast(`正在执行 Netcheck...`)
+            await runShellWithRoot(`rm -f /data/rex_Tailscale/tailscale_netcheck.log`)
+            const startRes = await runShellWithRoot(`cd /data/rex_Tailscale && /data/rex_Tailscale/service.sh netcheck > /data/rex_Tailscale/tailscale_netcheck.log 2>&1 & echo $!`, 500)
+            if (!startRes.success) { outputEl.textContent = `启动 Netcheck 失败`; return createToast("启动 Netcheck 失败", 'red') }
+            const pid = startRes.content ? startRes.content.trim() : ''
+            let count = 0
+            const maxWaitTime = 30
+            currentInterval = setInterval(async () => {
+                const logRes = await runShellWithRoot(`timeout 2s awk '{print}' /data/rex_Tailscale/tailscale_netcheck.log 2>/dev/null || echo ""`)
+                if (logRes.content) { outputEl.textContent = ts2cn(logRes.content); outputEl.scrollTop = outputEl.scrollHeight }
+                if (pid) {
+                    const checkProcess = await runShellWithRoot(`ps | grep ${sq(pid)} | grep -v grep`)
+                    const isRunning = checkProcess.content && checkProcess.content.includes(pid)
+                    if (!isRunning || count >= maxWaitTime) {
+                        clearCurrentInterval()
+                        const finalRes = await runShellWithRoot(`timeout 2s awk '{print}' /data/rex_Tailscale/tailscale_netcheck.log 2>/dev/null || echo ""`)
+                        if (finalRes.content) { outputEl.textContent = ts2cn(finalRes.content); outputEl.scrollTop = outputEl.scrollHeight }
+                        createToast("Netcheck 执行完成", 'green')
+                        await runShellWithRoot(`rm -f /data/rex_Tailscale/tailscale_netcheck.log`)
+                    }
+                }
+                count++
+            }, 1000)
+        }
+
+        pingBtn.onclick = executePing
+        netcheckBtn.onclick = executeNetcheck
+        inputEl.addEventListener('keypress', (e) => { if (e.key === 'Enter') executePing() })
+        closeBtn.onclick = () => { clearCurrentInterval(); close() }
+    }
+
+    const startBtn = document.createElement('button')
+    startBtn.id = 'tailscale_start_btn'
+    startBtn.innerHTML = '▶️ 启动'
+    startBtn.classList.add('btn')
+    startBtn.style.cssText = 'background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.2);color:#22c55e;padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    startBtn.onclick = async () => {
+        if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+        if (! await isInstall()) return createToast("请先安装！", 'red')
+        if (await isTailscaledRunning()) return createToast("已经在运行中", 'yellow')
+
+        createToast("正在启动...", 'yellow')
+        try {
+            await runShellWithRoot(`/data/rex_Tailscale/service.sh start`, 30000)
+        } catch (e) { }
+
+        let ok = false
+        for (let i = 0; i < 16; i++) {
+            await new Promise(r => setTimeout(r, 500))
+            if (await isTailscaledRunning()) { ok = true; break }
+        }
+
+        if (ok) {
+            createToast("✅ 已启动", 'green')
+        } else {
+            createToast("❌ 启动失败，请查看日志排查", 'red', 5000)
+        }
+        genLog()
+        setTimeout(async () => {
+            await updateAllStates()
+            updateStatusUI()
+        }, 1000)
+    }
+
+    const stopBtn = document.createElement('button')
+    stopBtn.id = 'tailscale_stop_btn'
+    stopBtn.innerHTML = '⏹️ 停止'
+    stopBtn.classList.add('btn')
+    stopBtn.style.cssText = 'background:rgba(220,53,69,.12);border-color:rgba(220,53,69,.2);color:#dc3545;padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    stopBtn.onclick = async () => {
+        if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+        if (! await isInstall()) return createToast("请先安装！", 'red')
+
+        if (_stopTimer) clearTimeout(_stopTimer)
+        _stopTimer = setTimeout(() => { _stopCount = 0 }, 2000)
+        if (_stopCount++ < 2) {
+            createToast(_stopCount === 1 ? "再点两次确认停止" : "再点一次确认停止", 'pink', 2000)
+            return
+        }
+        _stopCount = 0
+        clearTimeout(_stopTimer)
+        _stopTimer = null
+
+        createToast("正在停止...", 'yellow')
+        try {
+            await runShellWithRoot(`/data/rex_Tailscale/service.sh stop`, 30000)
+        } catch (e) { }
+
+        let ok = false
+        for (let i = 0; i < 16; i++) {
+            await new Promise(r => setTimeout(r, 500))
+            if (!(await isTailscaledRunning())) { ok = true; break }
+        }
+
+        if (ok) {
+            createToast("✅ 已停止", 'green')
+        } else {
+            createToast("❌ 停止失败，进程仍在运行", 'red', 5000)
+        }
+        genLog()
+        setTimeout(async () => {
+            await updateAllStates()
+            updateStatusUI()
+        }, 1000)
+    }
+
+    const restartBtn = document.createElement('button')
+    restartBtn.id = 'tailscale_restart_btn'
+    restartBtn.innerHTML = '🔄 重启'
+    restartBtn.classList.add('btn')
+    restartBtn.style.cssText = 'background:rgba(255,193,7,.12);border-color:rgba(255,193,7,.2);color:#ffc107;padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    restartBtn.onclick = async () => {
+        if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+        if (! await isInstall()) return createToast("请先安装！", 'red')
+
+        if (_restartTimer) clearTimeout(_restartTimer)
+        _restartTimer = setTimeout(() => { _restartCount = 0 }, 2000)
+        if (_restartCount++ < 2) {
+            createToast(_restartCount === 1 ? "再点两次确认重启" : "再点一次确认重启", 'pink', 2000)
+            return
+        }
+        _restartCount = 0
+        clearTimeout(_restartTimer)
+        _restartTimer = null
+
+        createToast("正在重启...", 'yellow')
+        try {
+            await runShellWithRoot(`/data/rex_Tailscale/service.sh stop`, 20000)
+        } catch (e) { }
+        for (let i = 0; i < 8; i++) {
+            await new Promise(r => setTimeout(r, 400))
+            if (!(await isTailscaledRunning())) break
+        }
+        try {
+            await runShellWithRoot(`/data/rex_Tailscale/service.sh start`, 20000)
+        } catch (e) { }
+
+        let ok = false
+        for (let i = 0; i < 16; i++) {
+            await new Promise(r => setTimeout(r, 500))
+            if (await isTailscaledRunning()) { ok = true; break }
+        }
+
+        createToast(ok ? "✅ 重启完成" : "❌ 重启失败，请查看日志", ok ? 'green' : 'red', ok ? 3000 : 5000)
+        genLog()
+        setTimeout(async () => {
+            await updateAllStates()
+            updateStatusUI()
+        }, 1000)
+    }
+
+    const adminBtn = document.createElement('button')
+    adminBtn.innerHTML = '🌐 控制台'
+    adminBtn.classList.add('btn')
+    adminBtn.style.cssText = 'background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.25);color:#38bdf8;padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    adminBtn.onclick = () => {
+        window.open('https://login.tailscale.com/admin/machines', '_blank')
+    }
+
+    const configLogBtn = document.createElement('button')
+    configLogBtn.id = 'tailscale_configlog_btn'
+    configLogBtn.classList.add('btn')
+    configLogBtn.innerHTML = '📝 配置/日志'
+    configLogBtn.style.cssText = 'background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.1);color:rgba(255,255,255,.7);padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    configLogBtn.onclick = () => {
+        configLogVisible = !configLogVisible
+        configLogBtn.style.background = configLogVisible ? 'var(--dark-btn-color-active)' : 'rgba(255,255,255,.05)'
+        const configLogContainer = document.querySelector('#tailscale_config_log_container')
+        if (configLogContainer) configLogContainer.style.display = configLogVisible ? '' : 'none'
+        const hintContainer = document.querySelector('#tailscale_hint_container')
+        if (hintContainer) hintContainer.style.display = configLogVisible ? '' : 'none'
+        if (configLogVisible) { showConf(); startLogPolling() }
+        else { stopLogPolling() }
+    }
+
+    const statusBtn = document.createElement('button')
+    statusBtn.innerHTML = '📋 设备列表'
+    statusBtn.classList.add('btn')
+    statusBtn.style.cssText = 'background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.1);color:rgba(255,255,255,.7);padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    statusBtn.onclick = async () => {
+        if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+        if (! await isInstall()) return createToast("请先安装Tailscale！", 'red')
+        if (!(await isTailscaledRunning())) return createToast("Tailscale 未运行，请先启动服务", 'red', 4000)
+        createToast("正在获取设备列表...")
+        const res = await runShellWithRoot(`/data/rex_Tailscale/service.sh list_devices`)
+        if (!res.success || !res.content) return createToast("获取设备列表失败", 'red')
+        const out = ts2cn(res.content)
+        if (/无法获取设备信息/.test(out)) return createToast("Tailscale 未运行，请先启动服务", 'red', 4000)
+        showDeviceDialog(out, "Tailscale 设备列表")
+    }
+
+    const networkBtn = document.createElement('button')
+    networkBtn.innerHTML = '🔍 网络诊断'
+    networkBtn.classList.add('btn')
+    networkBtn.style.cssText = 'background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.1);color:rgba(255,255,255,.7);padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    networkBtn.onclick = async () => {
+        if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+        showPingDialog()
+    }
+
+    const boot_on = document.createElement('button')
+    boot_on.id = "tailscale_boot_on"
+    boot_on.classList.add('btn')
+    boot_on.innerHTML = "⏳ 自启"
+    boot_on.style.cssText = 'background:rgba(168,85,247,.12);border-color:rgba(168,85,247,.2);color:#a855f7;padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    boot_on.onclick = async () => {
+        if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+        if (! await isInstall()) return createToast("请先安装！", 'red')
+        const isBootUp = await checkIsBootUp();
+        if (isBootUp) {
+            await runShellWithRoot(`sed -i '\\|^/data/rex_Tailscale/service.sh start$|d' /sdcard/ufi_tools_boot.sh`)
+            createToast("已取消开机自启", 'green')
+        } else {
+            await runShellWithRoot(`grep -qxF '/data/rex_Tailscale/service.sh start' /sdcard/ufi_tools_boot.sh || echo '/data/rex_Tailscale/service.sh start' >> /sdcard/ufi_tools_boot.sh`)
+            createToast("已设置开机自启", 'green')
+        }
+        updateBootBtnState()
+    }
+
+    const natBtn = document.createElement('button')
+    natBtn.id = "tailscale_nat_btn"
+    natBtn.classList.add('btn')
+    natBtn.innerHTML = '🔥 热点转发'
+    natBtn.title = "允许连接此设备热点的手机访问Tailscale内网"
+    natBtn.style.cssText = 'background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.1);color:rgba(255,255,255,.7);padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    natBtn.onclick = async () => {
+        if (! await checkAdvanceFunc()) return createToast("无Root权限！", 'red')
+        if (! await isInstall()) return createToast("请先安装Tailscale！", 'red')
+        if (!AP_ACCESS_ENABLED) {
+            const r = await runShellWithRoot("/data/rex_Tailscale/service.sh enable_ap_access")
+            createToast(r.content || "已开启热点转发", 'pink', 5000)
+        } else {
+            const r = await runShellWithRoot("/data/rex_Tailscale/service.sh disable_ap_access")
+            createToast(r.content || "已关闭热点转发", 'pink', 5000)
+        }
+        await updateNatBtnState()
+    }
+
+    const monitorBtn = document.createElement('button')
+    monitorBtn.id = "tailscale_monitor_btn"
+    monitorBtn.classList.add('btn')
+    monitorBtn.innerHTML = '🛰️ IPv6监测'
+    monitorBtn.style.cssText = 'background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.1);color:rgba(255,255,255,.7);padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    monitorBtn.onclick = async () => {
+        if (! await checkAdvanceFunc()) return createToast("无Root权限！")
+        const checkDisabled = await runShellWithRoot(`test -f /data/rex_Tailscale/flag/ipv6_monitor_disable && echo "exists" || echo "not_found"`)
+        if (checkDisabled.content && checkDisabled.content.includes("exists")) {
+            const r = await runShellWithRoot(`/data/rex_Tailscale/service.sh enable_ipv6_monitor`)
+            createToast(r.content || "IPv6网络监测已开启", 'green')
+        } else {
+            const r = await runShellWithRoot(`/data/rex_Tailscale/service.sh disable_ipv6_monitor`)
+            createToast(r.content || "IPv6网络监测已关闭", 'pink')
+        }
+        setTimeout(updateMonitorBtnState, 500)
+    }
+
+    const updateContainer = document.createElement('div')
+    updateContainer.id = 'tailscale_update_container'
+    updateContainer.style.cssText = 'display:none;align-items:center;'
+    const updateBtn = document.createElement('button')
+    updateBtn.id = 'tailscale_update_btn'
+    updateBtn.classList.add('btn')
+    updateBtn.innerHTML = '⬆️ 更新'
+    updateBtn.style.cssText = 'background:rgba(52,152,219,.12);border-color:rgba(52,152,219,.2);color:#5dade2;padding:4px 12px;font-size:.7rem;border-radius:6px;'
+    updateBtn.onclick = async () => {
+        if (isUpdating || isInstalling || isUninstalling) return
+        if (! await checkAdvanceFunc()) return createToast('无Root权限！', 'red')
+        if (! await isInstall()) return createToast('请先安装！', 'red')
+
+        isUpdating = true
+        try {
+            createToast('正在准备更新...')
+            const logId = 'tailscale_update_log_' + createRandomString(4)
+            const closeId = 'tailscale_update_close_' + createRandomString(4)
+            const { el, close } = createFixedToast('tailscale_update_toast', `
+                <div style="pointer-events:all;width:80vw;max-width:800px">
+                    <div class="title" style="margin:0">Tailscale 更新</div>
+                    <pre id="${logId}" style="white-space:pre-wrap;word-break:break-all;min-width:300px;max-height:400px;overflow:auto;background:#000;color:#0f0;padding:8px;border-radius:5px;font-size:12px;margin:10px 0;">正在更新，请稍候...</pre>
+                    <div style="text-align:right"><button id="${closeId}" style="font-size:12px">关闭</button></div>
+                </div>
+            `)
+            const logEl = el && el.querySelector(`#${logId}`)
+            const closeBtn2 = el && el.querySelector(`#${closeId}`)
+            if (closeBtn2) closeBtn2.onclick = () => close()
+
+            await runShellWithRoot(`rm -f /data/rex_Tailscale/tailscale_update.log`)
+            await runShellWithRoot(`nohup sh -c '/data/rex_Tailscale/service.sh update > /data/rex_Tailscale/tailscale_update.log 2>&1' > /dev/null 2>&1 &`, 500)
+
+            const maxWait = 600
+            let waited = 0
+            const iv = setInterval(async () => {
+                const r = await runShellWithRoot(`timeout 2s awk '{print}' /data/rex_Tailscale/tailscale_update.log 2>/dev/null || echo ""`)
+                if (logEl && r.content) {
+                    const converted = ts2cn(r.content
+                        .split('\n').filter(l => !l.startsWith('UPDATE_RESULT:')).join('\n')
+                        .replace(
+                            /(\d{4})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2}):(\d{2})/g,
+                            (m, Y, M, D, h, mi, s) => new Date(Date.UTC(Y, M - 1, D, h, mi, s))
+                                .toLocaleString('sv-SE').replace(/-/g, '/').replace('T', ' ')
+                        ))
+                    logEl.textContent = converted
+                    logEl.scrollTop = logEl.scrollHeight
+                }
+                if (r.content && r.content.includes('UPDATE_RESULT:no_update_needed')) {
+                    clearInterval(iv)
+                    createToast('已是最新版本，无需更新', 'green')
+                    await runShellWithRoot(`rm -f /data/rex_Tailscale/tailscale_update.log`)
+                } else if (r.content && r.content.includes('UPDATE_RESULT:updated')) {
+                    clearInterval(iv)
+                    createToast('更新成功！正在自动重启...', 'green')
+                    await runShellWithRoot(`rm -f /data/rex_Tailscale/tailscale_update.log`)
+                    await runShellWithRoot(`/data/rex_Tailscale/service.sh stop; sleep 1; /data/rex_Tailscale/service.sh start`)
+                    createToast('重启完成', 'green')
+                    genLog()
+                    updateBootBtnState()
+                } else if (r.content && r.content.includes('UPDATE_RESULT:failed')) {
+                    clearInterval(iv)
+                    createToast('更新失败，服务返回了非0状态，请检查日志', 'red')
+                    await runShellWithRoot(`rm -f /data/rex_Tailscale/tailscale_update.log`)
+                } else if (waited >= maxWait) {
+                    clearInterval(iv)
+                    createToast('更新超时，请检查网络或手动更新', 'red')
+                }
+                waited++
+            }, 1000)
+        } finally {
+            isUpdating = false
+        }
+    }
+    updateContainer.appendChild(updateBtn)
+
+    const uninstallContainer = document.createElement('div')
+    uninstallContainer.id = 'tailscale_uninstall_container'
+    uninstallContainer.style.cssText = 'display:none;align-items:center;'
+
+    const sleepLoop = async () => {
+        let mmContainer = null
+        while (!(mmContainer = document.querySelector('.functions-container'))) { await sleep(200) }
+        return mmContainer
+    }
+
+    const htmlTemplate = `
+    <div id="IFRAME_REX_${pluginName}" style="width: 100%; margin-top: 10px;">
+        <div class="title" style="margin: 6px 0; display:flex; align-items:center; gap:8px;">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" style="flex-shrink:0;">
+                <path d="M24 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm-9 9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm0-9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm6-6a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM3 24a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zm18 .5a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM6 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm9-9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm-3 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM6 3a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM3 5.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z" fill="currentColor"/>
+            </svg>
+            <strong>Tailscale</strong>
+            <div style="display:inline-block;" id="collapse_Tailscale_btn"></div>
+        </div>
+        <div class="collapse" id="collapse_Tailscale" data-name="close" style="height: 0px; overflow: hidden;">
+            <div class="collapse_box">
+
+                <div style="display:flex; align-items:center; gap:12px; padding:4px 0 10px 0; flex-wrap:wrap; font-size:.6rem; color:rgba(255,255,255,.4);">
+                    <span>状态: <span id="ts_status_text" style="color:rgba(255,255,255,.7);">检查中...</span> <span id="ts_status_dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#888; box-shadow:none;"></span></span>
+                    <span>组网IP: <strong id="ts_ip" style="color:rgba(255,255,255,.6);">-</strong></span>
+                    <span>插件版本: <strong id="ts_plugin_ver" style="color:rgba(255,255,255,.6);">v${_PREV_VER}</strong></span>
+                    <span>内核版本: <strong id="ts_version" style="color:rgba(255,255,255,.6);">-</strong></span>
+                </div>
+
+                <div id="tailscale_login_container" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;"></div>
+
+                <div id="tailscale_install_container" style="display:none;width:100%;"></div>
+
+                <div id="ts_group_main">
+                    <span style="font-size:.55rem; color:rgba(255,255,255,.2); width:100%; margin-top:4px; display:block;">⚙️ 服务控制</span>
+                    <div id="ts_main_buttons" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;"></div>
+                </div>
+
+                <div id="ts_group_network">
+                    <span style="font-size:.55rem; color:rgba(255,255,255,.2); width:100%; margin-top:4px; display:block;">🌐 网络</span>
+                    <div id="ts_network_buttons" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;"></div>
+                </div>
+
+                <div id="ts_group_panel">
+                    <span style="font-size:.55rem; color:rgba(255,255,255,.2); width:100%; margin-top:4px; display:block;">🖥️ 面板 / 更新</span>
+                    <div id="ts_panel_buttons" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;"></div>
+                </div>
+
+                <div id="Tailscale_main_content">
+                    <ul class="deviceList" id="tailscale_config_log_container" style="display:none;">
+                        <li style="padding:10px; display: flex; flex-wrap: wrap; gap: 10px;">
+                            <div style="flex: 1 1 300px;">
+                                <div class="title">
+                                    <span>配置文件</span>
+                                    <div>
+                                        <button style="margin:0!important;padding:2px 8px;" onclick="rexSaveTailscaleConfig()">保存并重启</button>
+                                        <button style="margin:0!important;padding:2px 8px;" onclick="rexReadTailscaleConfig()">读取</button>
+                                        <button style="margin:0!important;padding:2px 8px;" onclick="rexResetTailscaleConfig()">重置</button>
+                                    </div>
+                                </div>
+                                <textarea id="Tailscale_config" spellcheck="false" style="margin-top:4px;font-size:12px!important;font-family:monospace;border:1px solid #444;padding:8px;width:100%;height:300px;border-radius:5px;background:#1e1e1e;color:#d4d4d4;white-space:pre;"></textarea>
+                            </div>
+                            <div style="flex: 1 1 300px;">
+                                <div class="title">
+                                    <span>运行日志</span>
+                                    <button style="margin:0!important;padding:2px 8px;" onclick="rexReadTailscaleLog()">刷新</button>
+                                    <button style="margin:0!important;padding:2px 8px;" onclick="rexClearTailscaleLog()">清空</button>
+                                </div>
+                                <textarea id="Tailscale_textarea" disabled spellcheck="false" style="margin-top:4px;font-size:12px!important;font-family:monospace;border:1px solid #444;padding:8px;width:100%;height:300px;border-radius:5px;background:#000;color:#0f0;white-space:pre-wrap;word-break:break-all;"></textarea>
+                            </div>
+                        </li>
+                    </ul>
+                    <div id="tailscale_hint_container" style="display:none;font-size:12px; color:#666; padding: 5px;">提示: 首次启动后需要先登录</div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+    `
+
+    const mmContainer = await sleepLoop()
+    mmContainer.insertAdjacentHTML("afterend", htmlTemplate)
+
+    const mainBox = document.querySelector('#ts_main_buttons')
+    const netBox = document.querySelector('#ts_network_buttons')
+    const panelBox = document.querySelector('#ts_panel_buttons')
+
+    if (mainBox) {
+        mainBox.appendChild(boot_on)
+        mainBox.appendChild(startBtn)
+        mainBox.appendChild(stopBtn)
+        mainBox.appendChild(restartBtn)
+        mainBox.appendChild(adminBtn)
+        mainBox.appendChild(configLogBtn)
+    }
+    if (netBox) {
+        netBox.appendChild(natBtn)
+        netBox.appendChild(monitorBtn)
+        netBox.appendChild(statusBtn)
+        netBox.appendChild(networkBtn)
+    }
+    if (panelBox) {
+        panelBox.appendChild(updateContainer)
+        panelBox.appendChild(uninstallContainer)
+    }
+
+    updateAllStates()
+    updateStatusUI()
+
+    window.rexSaveTailscaleConfig = () => {
+        const Tailscale_config = document.querySelector('#Tailscale_config')
+        if (!Tailscale_config) return
+        createToast('正在上传配置...')
+        uploadTailscaleConfig(Tailscale_config.value)
+    }
+
+    window.rexReadTailscaleConfig = () => {
+        showConf()
+        createToast('配置已重新读取')
+    }
+
+    window.rexResetTailscaleConfig = () => {
+        if (_resetTimer) clearTimeout(_resetTimer)
+        _resetTimer = setTimeout(() => { _resetCount = 0 }, 2000)
+        if (_resetCount++ < 2) {
+            createToast(_resetCount === 1 ? "再点两次确认重置" : "再点一次确认重置", 'pink', 2000)
+            return
+        }
+        _resetCount = 0
+        clearTimeout(_resetTimer)
+        _resetTimer = null
+        const Tailscale_config = document.querySelector('#Tailscale_config')
+        if (!Tailscale_config) return
+        Tailscale_config.value = DEFAULT_CONFIG
+        createToast('正在上传默认配置...')
+        uploadTailscaleConfig(DEFAULT_CONFIG)
+    }
+
+    window.rexReadTailscaleLog = () => {
+        genLog()
+        createToast('日志已刷新')
+    }
+
+    window.rexClearTailscaleLog = async () => {
+        if (!confirm('确定要清空运行日志吗？')) return
+        await runShellWithRoot(`rm -f /dev/log/Tailscale_LOG.txt`)
+        const Tailscale_textarea = document.querySelector('#Tailscale_textarea')
+        if (Tailscale_textarea) Tailscale_textarea.value = ''
+        prevLogText = ''
+        createToast('日志已清空', 'green')
+    }
+
+    if (typeof collapseGen === 'function') {
+        collapseGen("#collapse_Tailscale_btn", "#collapse_Tailscale", "#collapse_Tailscale", (newVal) => {
+            if (newVal == 'open') {
+                startTimers()
+                isInstall().then(installed => {
+                    if (installed) {
+                        showConf()
+                        if (configLogVisible) startLogPolling()
+                    }
+                })
+                updateAllStates()
+                updateStatusUI()
+            } else {
+                stopLogPolling()
+                stopTimers()
+            }
+        })
+    }
+
+    if (localStorage.getItem("#collapse_Tailscale") === 'open') {
+        startTimers()
+        isInstall().then(installed => {
+            if (installed) {
+                showConf()
+                if (configLogVisible) startLogPolling()
+            }
+        })
+    }
+
+})()
+//</script>
