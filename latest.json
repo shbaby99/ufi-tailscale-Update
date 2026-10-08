@@ -1,5 +1,5 @@
 {
-  "version": "1.0.1",
+  "version": "1.0.3",
   "js": "https://cdn.jsdelivr.net/gh/shbaby99/ufi-tailscale-Update@main/rex_Tailscale.js",
   "notes": "初始版本"
 }
