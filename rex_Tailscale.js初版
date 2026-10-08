@@ -2,7 +2,7 @@
 (async () => {
 
     const pluginName = "Tailscale"
-    const _PREV_VER = '1.0.1'
+    const _PREV_VER = '1.0.0'
     const _SIG = '@@TS_PLUGIN_ID_x7k9m2p4@@'
     const _UPDATE_URL = 'https://cdn.jsdelivr.net/gh/shbaby99/ufi-tailscale-Update@main/latest.json'
     let _updating = false
@@ -194,10 +194,10 @@ FLAGS=""
         const url = _UPDATE_URL + '?_=' + Date.now();
         const tmp = '/data/local/tmp/_ts_manifest.tmp';
         const CURL = '/data/data/com.minikano.f50_sms/files/curl';
-        await run(`rm -f ${sq(tmp)}`, 1000);
-        const r = await run(`${CURL} -sL --connect-timeout 5 --max-time 10 ${sq(url)} -o ${sq(tmp)} && timeout 2s awk '{print}' ${sq(tmp)}`, 15000);
+        await runShellWithRoot(`rm -f ${sq(tmp)}`, 1000);
+        const r = await runShellWithRoot(`${CURL} -sL --connect-timeout 5 --max-time 10 ${sq(url)} -o ${sq(tmp)} && timeout 2s awk '{print}' ${sq(tmp)}`, 15000);
         const text = String(r?.content || '').trim();
-        await run(`rm -f ${sq(tmp)}`, 1000);
+        await runShellWithRoot(`rm -f ${sq(tmp)}`, 1000);
         if (!text || text[0] !== '{') return null;
         try {
             const j = JSON.parse(text);
@@ -209,18 +209,18 @@ FLAGS=""
     const _applyPluginUpdate = async (newJsUrl) => {
         const tmpJs = '/data/local/tmp/_ts_new.js';
         const CURL = '/data/data/com.minikano.f50_sms/files/curl';
-        await run(`rm -f ${sq(tmpJs)}`, 2000);
-        await run(`${CURL} -sL --connect-timeout 8 --max-time 60 ${sq(newJsUrl)} -o ${sq(tmpJs)}`, 65000);
-        const sizeR = await run(`stat -c %s ${sq(tmpJs)} 2>/dev/null || echo 0`, 5000);
+        await runShellWithRoot(`rm -f ${sq(tmpJs)}`, 2000);
+        await runShellWithRoot(`${CURL} -sL --connect-timeout 8 --max-time 60 ${sq(newJsUrl)} -o ${sq(tmpJs)}`, 65000);
+        const sizeR = await runShellWithRoot(`stat -c %s ${sq(tmpJs)} 2>/dev/null || echo 0`, 5000);
         const size = parseInt(String(sizeR?.content || '0').trim(), 10) || 0;
-        if (size < 500) { await run(`rm -f ${sq(tmpJs)}`); throw new Error('新文件下载失败或过小(实际:' + size + ')'); }
+        if (size < 500) { await runShellWithRoot(`rm -f ${sq(tmpJs)}`); throw new Error('新文件下载失败或过小(实际:' + size + ')'); }
         const currentText = await getCustomHead();
         if (!currentText) throw new Error('无法读取插件列表');
         const _reEsc = s => s.replace(/[\[\]]/g, '\\$&');
         const _PS = '<!-- [KANO_PLUGIN_START]';
         const _PE = '<!-- [KANO_PLUGIN_END]';
         const pluginRegex = new RegExp(_reEsc(_PS) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _reEsc(_PE) + '\\s*\\1\\s*-->', 'g');
-        const newJs = await run(`timeout 5s awk '{print}' ${sq(tmpJs)}`, 10000);
+        const newJs = await runShellWithRoot(`timeout 5s awk '{print}' ${sq(tmpJs)}`, 10000);
         const newJsContent = String(newJs?.content || '');
         if (!newJsContent || newJsContent.length < 500) throw new Error('新文件内容异常');
         let found = false, newText = currentText, match;
@@ -233,8 +233,8 @@ FLAGS=""
                 break;
             }
         }
-        if (!found) { await run(`rm -f ${sq(tmpJs)}`); throw new Error('未找到当前插件'); }
-        await run(`rm -f ${sq(tmpJs)}`, 2000);
+        if (!found) { await runShellWithRoot(`rm -f ${sq(tmpJs)}`); throw new Error('未找到当前插件'); }
+        await runShellWithRoot(`rm -f ${sq(tmpJs)}`, 2000);
         const saveResult = await setCustomHead(newText);
         if (!saveResult || saveResult.result !== 'success') throw new Error('保存失败');
         return true;
@@ -1200,6 +1200,7 @@ FLAGS=""
         if (! await checkAdvanceFunc()) return createToast('无Root权限！', 'red')
         if (! await isInstall()) return createToast('请先安装！', 'red')
 
+        // ═══ 第一步：检查插件更新 ═══
         if (!_manifest) {
             _updating = true
             createToast('正在检查更新...')
