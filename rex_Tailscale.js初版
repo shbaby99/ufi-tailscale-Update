@@ -170,7 +170,7 @@ FLAGS=""
             .replace(/control: controlhttp: forcing port 443 dial due to recent noise dial/gi, '控制服务器：强制用 443 端口')
             .replace(/Starting tailscale update\.\.\./gi, '开始 Tailscale 检查更新…')
             .replace(/dns: resolver: forward: no upstream resolvers set, returning SERVFAIL/gi, 'DNS 转发：没有上游 DNS，返回失败')
-            .replace(/already running stable version\s*(\S+);\s*no update needed/gi, '已是稳定版 $1，无需更新')
+            .replace(/already running stable version\s*(\S+);\s*no update needed/gi, '已是最新版 $1，无需更新')
             .replace(/SUCCESS: Tailscale configured/gi, '✅ Tailscale 配置成功')
             .replace(/Starting IPv6 log monitor\.\.\./gi, '启动 IPv6 日志监控…')
             .replace(/Some peers are advertising routes but --accept-routes is false/gi, '有设备宣告了子网路由，但你没开 --accept-routes（不影响使用）')
