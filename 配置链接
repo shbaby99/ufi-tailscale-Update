@@ -3,4 +3,4 @@ https://obfuscator.io/legacy-playground
 
 //清 jsDelivr 缓存
 https://cdn.jsdelivr.net/gh/shbaby99/ufi-tailscale-Update@main/rex_Tailscale.js
-https://cdn.jsdelivr.net/gh/shbaby99/ufi-tailscale-Update@main/latest.json
+https://purge.jsdelivr.net/gh/shbaby99/ufi-tailscale-Update@main/latest.json
