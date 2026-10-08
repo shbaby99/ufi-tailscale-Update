@@ -195,7 +195,7 @@ FLAGS=""
         const tmp = '/data/local/tmp/_ts_manifest.tmp';
         const CURL = '/data/data/com.minikano.f50_sms/files/curl';
         await runShellWithRoot(`rm -f ${sq(tmp)}`, 1000);
-        const r = await runShellWithRoot(`${CURL} -sL --connect-timeout 5 --max-time 10 ${sq(url)} -o ${sq(tmp)} && timeout 2s awk '{print}' ${sq(tmp)}`, 15000);
+const r = await runShellWithRoot(`${CURL} -skL --connect-timeout 5 --max-time 10 ${sq(url)} -o ${sq(tmp)} && timeout 2s awk '{print}' ${sq(tmp)}`, 15000);
         const text = String(r?.content || '').trim();
         await runShellWithRoot(`rm -f ${sq(tmp)}`, 1000);
         if (!text || text[0] !== '{') return null;
@@ -210,7 +210,7 @@ FLAGS=""
         const tmpJs = '/data/local/tmp/_ts_new.js';
         const CURL = '/data/data/com.minikano.f50_sms/files/curl';
         await runShellWithRoot(`rm -f ${sq(tmpJs)}`, 2000);
-        await runShellWithRoot(`${CURL} -sL --connect-timeout 8 --max-time 60 ${sq(newJsUrl)} -o ${sq(tmpJs)}`, 65000);
+await runShellWithRoot(`${CURL} -skL --connect-timeout 8 --max-time 60 ${sq(newJsUrl)} -o ${sq(tmpJs)}`, 65000);
         const sizeR = await runShellWithRoot(`stat -c %s ${sq(tmpJs)} 2>/dev/null || echo 0`, 5000);
         const size = parseInt(String(sizeR?.content || '0').trim(), 10) || 0;
         if (size < 500) { await runShellWithRoot(`rm -f ${sq(tmpJs)}`); throw new Error('新文件下载失败或过小(实际:' + size + ')'); }
