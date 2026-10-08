@@ -4,7 +4,7 @@
     const pluginName = "Tailscale"
     const _PREV_VER = '1.0.3'
     const _SIG = '@@TS_PLUGIN_ID_x7k9m2p4@@'
-const _UPDATE_URL = 'https://cdn.jsdelivr.net/gh/shbaby99/ufi-tailscale-Update@f09c8d3d10494c47ae34b5088b85059be37feca3/latest.json'
+    const _UPDATE_URL = 'https://cdn.jsdelivr.net/gh/shbaby99/ufi-tailscale-Update@main/latest.json'
     let _updating = false
     let _manifest = null
     let _hasPluginUpdate = false
